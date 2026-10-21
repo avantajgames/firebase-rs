@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fmt::Debug;
+use std::sync::OnceLock;
 use url::Url;
 use utils::check_uri;
 
@@ -18,6 +19,12 @@ mod errors;
 mod params;
 mod sse;
 mod utils;
+
+/// One client for all requests so connections to the database are reused.
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
 
 #[derive(Debug)]
 pub struct Firebase {
@@ -156,7 +163,7 @@ impl Firebase {
     }
 
     async fn request(&self, method: Method, data: Option<Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
-        let client = reqwest::Client::new();
+        let client = http_client();
         let mut request_builder = match method {
             Method::GET => client.get(self.uri.to_string()),
             Method::PUT | Method::PATCH | Method::POST => {
