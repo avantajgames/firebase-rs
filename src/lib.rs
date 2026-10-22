@@ -7,6 +7,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::fmt::Debug;
 use std::sync::OnceLock;
+use std::time::Duration;
 use url::Url;
 use utils::check_uri;
 
@@ -23,7 +24,17 @@ mod utils;
 /// One client for all requests so connections to the database are reused.
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            // Drop idle connections before the server closes them, so a request
+            // after a pause doesn't land on a dead socket.
+            .pool_idle_timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(5))
+            // A request that hangs fails instead of holding the caller for minutes.
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("failed to build HTTP client")
+    })
 }
 
 #[derive(Debug)]
