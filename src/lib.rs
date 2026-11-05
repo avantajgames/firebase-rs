@@ -162,7 +162,24 @@ impl Firebase {
         self.uri.to_string()
     }
 
+    /// Reads are retried once on a transient failure: a GET changes nothing, so repeating it
+    /// is safe. Writes are not, since a PATCH with a server-side increment or a POST would apply
+    /// twice.
     async fn request(&self, method: Method, data: Option<Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
+        let attempts = if method == Method::GET { 2 } else { 1 };
+        let mut result = self.request_once(&method, data.as_ref(), include_etag, etag).await;
+        for _ in 1..attempts {
+            match &result {
+                Err(err) if err.is_transient() => {
+                    result = self.request_once(&method, data.as_ref(), include_etag, etag).await;
+                }
+                _ => break,
+            }
+        }
+        result
+    }
+
+    async fn request_once(&self, method: &Method, data: Option<&Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
         let client = http_client();
         let mut request_builder = match method {
             Method::GET => client.get(self.uri.to_string()),
@@ -170,9 +187,9 @@ impl Firebase {
                 if data.is_none() {
                     return Err(RequestError::SerializeError);
                 }
-                let builder = if method == Method::PUT {
+                let builder = if *method == Method::PUT {
                     client.put(self.uri.to_string())
-                } else if method == Method::POST {
+                } else if *method == Method::POST {
                     client.post(self.uri.to_string())
                 } else {
                     client.patch(self.uri.to_string())
@@ -208,10 +225,10 @@ impl Firebase {
                         let response_text = response.text().await.unwrap_or_default();
                         Ok(Response {etag, data: response_text })
                     }
-                    _ => Err(RequestError::NetworkError),
+                    status => Err(RequestError::HttpStatus(status.as_u16())),
                 }
             }
-            Err(_) => Err(RequestError::NetworkError),
+            Err(err) => Err(RequestError::NetworkError(err.to_string())),
         }
     }
 
@@ -422,7 +439,74 @@ impl Firebase {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Firebase, UrlParseError};
+    use crate::{Firebase, RequestError, UrlParseError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A loopback HTTP server that answers each request with the next status in `statuses`
+    /// (the last one repeats). Returns its URL and the number of requests it has received.
+    async fn scripted_server(statuses: &'static [u16]) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let status = statuses[n.min(statuses.len() - 1)];
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = "{\"a\":1}";
+                let reply = format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        (url, served)
+    }
+
+    #[tokio::test]
+    async fn a_read_is_retried_once_after_a_server_error() {
+        let (url, served) = scripted_server(&[503, 200]).await;
+        let response = Firebase::new(&url).unwrap().at("x").get_as_string(None, None).await.unwrap();
+        assert_eq!(response.data, "{\"a\":1}");
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_read_gives_up_after_the_second_failure_and_names_the_status() {
+        let (url, served) = scripted_server(&[500]).await;
+        let err = Firebase::new(&url).unwrap().at("x").get_as_string(None, None).await.unwrap_err();
+        assert!(matches!(err, RequestError::HttpStatus(500)));
+        assert_eq!(err.to_string(), "Unexpected HTTP status 500");
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_client_error_is_not_retried() {
+        let (url, served) = scripted_server(&[401]).await;
+        let err = Firebase::new(&url).unwrap().at("x").get_as_string(None, None).await.unwrap_err();
+        assert!(matches!(err, RequestError::HttpStatus(401)));
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_write_is_never_retried() {
+        let (url, served) = scripted_server(&[503, 200]).await;
+        let err = Firebase::new(&url).unwrap().at("x").put_json(serde_json::json!(1)).await.unwrap_err();
+        assert!(matches!(err, RequestError::HttpStatus(503)));
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn no_response_is_a_network_error_with_its_cause() {
+        // Bind and drop: nothing listens on the port any more.
+        let port = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        let err = Firebase::new(&format!("http://127.0.0.1:{port}/")).unwrap().get_as_string(None, None).await.unwrap_err();
+        assert!(matches!(&err, RequestError::NetworkError(cause) if !cause.is_empty()), "{err}");
+    }
 
     const URI: &str = "https://firebase_id.firebaseio.com";
     const URI_WITH_SLASH: &str = "https://firebase_id.firebaseio.com/";
