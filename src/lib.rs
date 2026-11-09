@@ -228,7 +228,7 @@ impl Firebase {
                     status => Err(RequestError::HttpStatus(status.as_u16())),
                 }
             }
-            Err(err) => Err(RequestError::NetworkError(err.to_string())),
+            Err(err) => Err(RequestError::NetworkError(describe_transport_error(err))),
         }
     }
 
@@ -437,6 +437,20 @@ impl Firebase {
     }
 }
 
+/// A transport error as text: its whole cause chain (reqwest's own message only says
+/// "error sending request"), without the request URL, which carries the access token.
+fn describe_transport_error(err: reqwest::Error) -> String {
+    let err = err.without_url();
+    let mut text = err.to_string();
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{Firebase, RequestError, UrlParseError};
@@ -506,6 +520,16 @@ mod tests {
         let port = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
         let err = Firebase::new(&format!("http://127.0.0.1:{port}/")).unwrap().get_as_string(None, None).await.unwrap_err();
         assert!(matches!(&err, RequestError::NetworkError(cause) if !cause.is_empty()), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_network_error_names_its_cause_but_not_the_url_or_token() {
+        let port = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/?access_token=secret_token");
+        let err = Firebase::new(&url).unwrap().at("members").at("uid").get_as_string(None, None).await.unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("secret_token") && !text.contains("access_token") && !text.contains("members"), "{text}");
+        assert!(text.to_lowercase().contains("connect"), "the cause should be named: {text}");
     }
 
     const URI: &str = "https://firebase_id.firebaseio.com";
