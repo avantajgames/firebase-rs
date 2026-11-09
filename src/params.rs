@@ -66,18 +66,16 @@ impl Params {
 #[cfg(test)]
 mod tests {
     use crate::params::Params;
-    use std::collections::HashMap;
     use url::Url;
 
     #[test]
     fn check_params() {
-        let mut params: HashMap<String, String> = HashMap::new();
-        params.insert("param_1".to_owned(), "value_1".to_owned());
-        params.insert("param_2".to_owned(), "value_2".to_owned());
+        // A list, not a HashMap: the expected query depends on the order of the params.
+        let params = [("param_1", "value_1"), ("param_2", "value_2")];
         let mut param = Params {
             uri: Url::parse("https://github.com/emreyalvac").unwrap(),
         };
-        for (key, value) in params.iter() {
+        for (key, value) in params {
             param.add_param(key, value);
         }
         assert_eq!(
