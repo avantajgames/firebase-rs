@@ -19,6 +19,7 @@ serde = { version = "1.0.217", features = ["derive"] }
 itertools = "0.14.0"
 eventsource-client = "0.13.0"
 futures-util = "0.3.31"
+tokio = { version = "1.43.0", features = ["time"] }
 
 [dev-dependencies]
 tokio = { version = "1.43.0", features = ["rt", "macros", "rt-multi-thread", "net", "io-util"] }
