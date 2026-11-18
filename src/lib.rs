@@ -162,38 +162,26 @@ impl Firebase {
         self.uri.to_string()
     }
 
-    /// Sends the request under the retry policy its method and body allow (see [`RetryPolicy`]).
+    /// Sends the request under the retry policy its method, condition and body allow (see [`RetryPolicy`]).
     async fn request(&self, method: Method, data: Option<Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
-        let policy = match method {
-            Method::GET => &READS,
-            Method::PUT if is_repeatable(data.as_ref()) => &PUTS,
+        let policy = match (&method, etag) {
+            (Method::GET, _) => &READS,
+            (Method::PUT, None) if is_repeatable(data.as_ref()) => &PUTS,
             _ => &NO_RETRY,
         };
-        self.request_with(policy, &method, data.as_ref(), include_etag, etag).await
-    }
-
-    async fn request_with(&self, policy: &RetryPolicy, method: &Method, data: Option<&Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
-        let mut result = self.request_once(method, data, include_etag, etag).await;
-        let mut retried = false;
+        let data = data.as_ref();
+        let mut result = self.request_once(&method, data, include_etag, etag).await;
         for &delay_ms in policy.delays_ms {
             if !matches!(&result, Err(err) if (policy.retry_on)(err)) {
                 break;
             }
             backoff(delay_ms).await;
-            result = self.request_once(method, data, include_etag, etag).await;
-            retried = true;
+            result = self.request_once(&method, data, include_etag, etag).await;
         }
-        let attempt = result?;
-        if retried && attempt.precondition_failed && stored_value_is(&attempt.response.data, data) {
-            // A reset hid the 200 of an earlier attempt: the stored value is ours. Answer as
-            // that 200 would have, so a caller does not take its own write for a conflict.
-            let etag = if include_etag { attempt.response.etag } else { None };
-            return Ok(Response { etag, data: attempt.response.data });
-        }
-        Ok(attempt.response)
+        result
     }
 
-    async fn request_once(&self, method: &Method, data: Option<&Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Attempt> {
+    async fn request_once(&self, method: &Method, data: Option<&Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
         let client = http_client();
         let mut request_builder = match method {
             Method::GET => client.get(self.uri.to_string()),
@@ -232,12 +220,12 @@ impl Firebase {
                         if response_text == "null" {
                             response_text = String::default();
                         }
-                        Ok(Attempt { response: Response { etag, data: response_text }, precondition_failed: false })
+                        Ok(Response { etag, data: response_text })
                     }
                     StatusCode::PRECONDITION_FAILED => {
                         // create a new response with the etag value and with a new response body
                         let response_text = response.text().await.unwrap_or_default();
-                        Ok(Attempt { response: Response { etag, data: response_text }, precondition_failed: true })
+                        Ok(Response { etag, data: response_text })
                     }
                     status => Err(RequestError::HttpStatus(status.as_u16())),
                 }
@@ -250,7 +238,7 @@ impl Firebase {
         Box::pin(async move {
             if let Some(etag) = etag {
                 let data = json!(value);
-                let updated_response = self.request_with(&NO_RETRY, &Method::PUT, Some(&data), false, Some(etag.as_str())).await;
+                let updated_response = self.request(Method::PUT, Some(data), false, Some(etag.as_str())).await;
                 if let Ok(response) = &updated_response {
                     if response.etag.is_none() {
                         return updated_response;
@@ -460,20 +448,16 @@ struct RetryPolicy {
 
 /// A GET changes nothing: retried after no response, 429 or 5xx.
 const READS: RetryPolicy = RetryPolicy { delays_ms: &[200, 400], retry_on: RequestError::is_transient };
-/// A PUT without server values writes the same thing again, so it is retried once, and only when
-/// there was no response at all. A conditional one that did land is settled in `request_with`.
+/// An unconditional PUT without server values writes the same thing again, so it is retried once,
+/// and only when there was no response at all. A conditional PUT (with an ETag) is not: after a
+/// reset, a 412 cannot tell whether the stored value is our landed write or an equal one written by
+/// someone else in between (ABA, e.g. two increments of a counter from the same value).
 const PUTS: RetryPolicy = RetryPolicy { delays_ms: &[200], retry_on: |err| matches!(err, RequestError::NetworkError(_)) };
-/// POST (push), PATCH (may carry increments), DELETE, PUTs with `.sv`, and the PUT inside
-/// `update_atomically_by` (a step of an increment).
+/// POST (push), PATCH (may carry increments), DELETE, PUTs with `.sv`, and conditional PUTs
+/// (including each step of `update_atomically_by`).
 const NO_RETRY: RetryPolicy = RetryPolicy { delays_ms: &[], retry_on: |_| false };
 /// So that requests that failed together do not retry in step.
 const RETRY_JITTER_MS: u64 = 100;
-
-/// One HTTP exchange that got a response the caller can use (200 or 412).
-struct Attempt {
-    response: Response,
-    precondition_failed: bool,
-}
 
 async fn backoff(delay_ms: u64) {
     let nanos = std::time::SystemTime::now()
@@ -493,12 +477,6 @@ fn is_repeatable(data: Option<&Value>) -> bool {
         }
     }
     data.map_or(false, |value| !has_server_value(value))
-}
-
-/// Whether the value a 412 reports as stored is the one this request sent.
-fn stored_value_is(stored: &str, sent: Option<&Value>) -> bool {
-    let stored = if stored.is_empty() { Some(Value::Null) } else { serde_json::from_str::<Value>(stored).ok() };
-    matches!((stored, sent), (Some(stored), Some(sent)) if stored == *sent)
 }
 
 /// A transport error as text: its whole cause chain (reqwest's own message only says
@@ -625,29 +603,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_conditional_put_whose_first_attempt_landed_is_a_success() {
-        // The reset hid the 200; the retry finds our own value under a new ETag.
+    async fn a_conditional_put_is_not_retried_after_a_reset() {
+        // A retry's 412 could not tell our landed write from an equal one made in between.
         let (url, served) = scripted_server(&[Reply::Drop, Reply::With(412, "{\"a\":1}")]).await;
-        let response = db(&url).set_with_key("k", &json!({"a": 1}), None, Some("old")).await.unwrap();
-        assert_eq!(response.etag, None, "a success has no ETag unless one was asked for");
-        assert_eq!(response.data, "{\"a\":1}");
-        assert_eq!(served.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn a_conditional_put_that_landed_keeps_the_etag_when_asked_for() {
-        let (url, _) = scripted_server(&[Reply::Drop, Reply::With(412, "null")]).await;
-        let response = db(&url).set_with_key("k", &Value::Null, Some(true), Some("old")).await.unwrap();
-        assert_eq!(response.etag.as_deref(), Some("tag1"));
-    }
-
-    #[tokio::test]
-    async fn a_conditional_put_retry_still_reports_a_real_conflict() {
-        let (url, served) = scripted_server(&[Reply::Drop, Reply::With(412, "{\"a\":2}")]).await;
-        let response = db(&url).set_with_key("k", &json!({"a": 1}), None, Some("old")).await.unwrap();
-        assert_eq!(response.etag.as_deref(), Some("tag1"));
-        assert_eq!(response.data, "{\"a\":2}");
-        assert_eq!(served.load(Ordering::SeqCst), 2);
+        let err = db(&url).set_with_key("k", &json!({"a": 1}), None, Some("old")).await.unwrap_err();
+        assert!(matches!(err, RequestError::NetworkError(_)), "{err}");
+        assert_eq!(served.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
