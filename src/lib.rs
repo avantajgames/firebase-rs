@@ -162,24 +162,38 @@ impl Firebase {
         self.uri.to_string()
     }
 
-    /// Reads are retried once on a transient failure: a GET changes nothing, so repeating it
-    /// is safe. Writes are not, since a PATCH with a server-side increment or a POST would apply
-    /// twice.
+    /// Sends the request under the retry policy its method and body allow (see [`RetryPolicy`]).
     async fn request(&self, method: Method, data: Option<Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
-        let attempts = if method == Method::GET { 2 } else { 1 };
-        let mut result = self.request_once(&method, data.as_ref(), include_etag, etag).await;
-        for _ in 1..attempts {
-            match &result {
-                Err(err) if err.is_transient() => {
-                    result = self.request_once(&method, data.as_ref(), include_etag, etag).await;
-                }
-                _ => break,
-            }
-        }
-        result
+        let policy = match method {
+            Method::GET => &READS,
+            Method::PUT if is_repeatable(data.as_ref()) => &PUTS,
+            _ => &NO_RETRY,
+        };
+        self.request_with(policy, &method, data.as_ref(), include_etag, etag).await
     }
 
-    async fn request_once(&self, method: &Method, data: Option<&Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
+    async fn request_with(&self, policy: &RetryPolicy, method: &Method, data: Option<&Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
+        let mut result = self.request_once(method, data, include_etag, etag).await;
+        let mut retried = false;
+        for &delay_ms in policy.delays_ms {
+            if !matches!(&result, Err(err) if (policy.retry_on)(err)) {
+                break;
+            }
+            backoff(delay_ms).await;
+            result = self.request_once(method, data, include_etag, etag).await;
+            retried = true;
+        }
+        let attempt = result?;
+        if retried && attempt.precondition_failed && stored_value_is(&attempt.response.data, data) {
+            // A reset hid the 200 of an earlier attempt: the stored value is ours. Answer as
+            // that 200 would have, so a caller does not take its own write for a conflict.
+            let etag = if include_etag { attempt.response.etag } else { None };
+            return Ok(Response { etag, data: attempt.response.data });
+        }
+        Ok(attempt.response)
+    }
+
+    async fn request_once(&self, method: &Method, data: Option<&Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Attempt> {
         let client = http_client();
         let mut request_builder = match method {
             Method::GET => client.get(self.uri.to_string()),
@@ -218,12 +232,12 @@ impl Firebase {
                         if response_text == "null" {
                             response_text = String::default();
                         }
-                        Ok(Response { etag, data: response_text })
+                        Ok(Attempt { response: Response { etag, data: response_text }, precondition_failed: false })
                     }
                     StatusCode::PRECONDITION_FAILED => {
                         // create a new response with the etag value and with a new response body
                         let response_text = response.text().await.unwrap_or_default();
-                        Ok(Response {etag, data: response_text })
+                        Ok(Attempt { response: Response { etag, data: response_text }, precondition_failed: true })
                     }
                     status => Err(RequestError::HttpStatus(status.as_u16())),
                 }
@@ -236,7 +250,7 @@ impl Firebase {
         Box::pin(async move {
             if let Some(etag) = etag {
                 let data = json!(value);
-                let updated_response = self.request(Method::PUT, Some(data), false, Some(etag).as_deref()).await;
+                let updated_response = self.request_with(&NO_RETRY, &Method::PUT, Some(&data), false, Some(etag.as_str())).await;
                 if let Ok(response) = &updated_response {
                     if response.etag.is_none() {
                         return updated_response;
@@ -437,6 +451,56 @@ impl Firebase {
     }
 }
 
+/// Which failures of a request are tried again, and after which pauses.
+struct RetryPolicy {
+    /// One pause per retry, before it; [`RETRY_JITTER_MS`] at most is added to each.
+    delays_ms: &'static [u64],
+    retry_on: fn(&RequestError) -> bool,
+}
+
+/// A GET changes nothing: retried after no response, 429 or 5xx.
+const READS: RetryPolicy = RetryPolicy { delays_ms: &[200, 400], retry_on: RequestError::is_transient };
+/// A PUT without server values writes the same thing again, so it is retried once, and only when
+/// there was no response at all. A conditional one that did land is settled in `request_with`.
+const PUTS: RetryPolicy = RetryPolicy { delays_ms: &[200], retry_on: |err| matches!(err, RequestError::NetworkError(_)) };
+/// POST (push), PATCH (may carry increments), DELETE, PUTs with `.sv`, and the PUT inside
+/// `update_atomically_by` (a step of an increment).
+const NO_RETRY: RetryPolicy = RetryPolicy { delays_ms: &[], retry_on: |_| false };
+/// So that requests that failed together do not retry in step.
+const RETRY_JITTER_MS: u64 = 100;
+
+/// One HTTP exchange that got a response the caller can use (200 or 412).
+struct Attempt {
+    response: Response,
+    precondition_failed: bool,
+}
+
+async fn backoff(delay_ms: u64) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    tokio::time::sleep(std::time::Duration::from_millis(delay_ms + nanos % (RETRY_JITTER_MS + 1))).await;
+}
+
+/// A PUT body can be sent twice unless it asks the server to compute a value (`.sv`).
+fn is_repeatable(data: Option<&Value>) -> bool {
+    fn has_server_value(value: &Value) -> bool {
+        match value {
+            Value::Object(fields) => fields.contains_key(".sv") || fields.values().any(has_server_value),
+            Value::Array(items) => items.iter().any(has_server_value),
+            _ => false,
+        }
+    }
+    data.map_or(false, |value| !has_server_value(value))
+}
+
+/// Whether the value a 412 reports as stored is the one this request sent.
+fn stored_value_is(stored: &str, sent: Option<&Value>) -> bool {
+    let stored = if stored.is_empty() { Some(Value::Null) } else { serde_json::from_str::<Value>(stored).ok() };
+    matches!((stored, sent), (Some(stored), Some(sent)) if stored == *sent)
+}
+
 /// A transport error as text: its whole cause chain (reqwest's own message only says
 /// "error sending request"), without the request URL, which carries the access token.
 fn describe_transport_error(err: reqwest::Error) -> String {
@@ -458,10 +522,21 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use serde_json::{json, Value};
+    use std::time::{Duration, Instant};
 
-    /// A loopback HTTP server that answers each request with the next status in `statuses`
-    /// (the last one repeats). Returns its URL and the number of requests it has received.
-    async fn scripted_server(statuses: &'static [u16]) -> (String, Arc<AtomicUsize>) {
+    /// What the scripted server does with one request.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// Answer with this status and body (and an ETag header).
+        With(u16, &'static str),
+        /// Read the request and close the connection without answering, as a reset does.
+        Drop,
+    }
+
+    /// A loopback HTTP server that handles each request with the next entry of `script` (the
+    /// last one repeats). Returns its URL and the number of requests it has received.
+    async fn scripted_server(script: &'static [Reply]) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let served = Arc::new(AtomicUsize::new(0));
@@ -470,48 +545,143 @@ mod tests {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let n = counter.fetch_add(1, Ordering::SeqCst);
-                let status = statuses[n.min(statuses.len() - 1)];
                 let mut buf = [0u8; 4096];
                 let _ = socket.read(&mut buf).await;
-                let body = "{\"a\":1}";
-                let reply = format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
-                let _ = socket.write_all(reply.as_bytes()).await;
+                match script[n.min(script.len() - 1)] {
+                    Reply::Drop => drop(socket),
+                    Reply::With(status, body) => {
+                        let reply = format!("HTTP/1.1 {status} X\r\netag: tag{n}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                        let _ = socket.write_all(reply.as_bytes()).await;
+                    }
+                }
             }
         });
         (url, served)
     }
 
+    const OK: Reply = Reply::With(200, "{\"a\":1}");
+
+    fn db(url: &str) -> Firebase {
+        Firebase::new(url).unwrap().at("x")
+    }
+
     #[tokio::test]
-    async fn a_read_is_retried_once_after_a_server_error() {
-        let (url, served) = scripted_server(&[503, 200]).await;
-        let response = Firebase::new(&url).unwrap().at("x").get_as_string(None, None).await.unwrap();
+    async fn a_read_is_retried_after_a_server_error() {
+        let (url, served) = scripted_server(&[Reply::With(503, ""), OK]).await;
+        let response = db(&url).get_as_string(None, None).await.unwrap();
         assert_eq!(response.data, "{\"a\":1}");
         assert_eq!(served.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
-    async fn a_read_gives_up_after_the_second_failure_and_names_the_status() {
-        let (url, served) = scripted_server(&[500]).await;
-        let err = Firebase::new(&url).unwrap().at("x").get_as_string(None, None).await.unwrap_err();
+    async fn a_read_is_retried_after_a_reset() {
+        let (url, served) = scripted_server(&[Reply::Drop, Reply::Drop, OK]).await;
+        let response = db(&url).get_as_string(None, None).await.unwrap();
+        assert_eq!(response.data, "{\"a\":1}");
+        assert_eq!(served.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_read_backs_off_and_gives_up_after_two_retries_naming_the_status() {
+        let (url, served) = scripted_server(&[Reply::With(500, "")]).await;
+        let started = Instant::now();
+        let err = db(&url).get_as_string(None, None).await.unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(600), "{:?}", started.elapsed());
         assert!(matches!(err, RequestError::HttpStatus(500)));
         assert_eq!(err.to_string(), "Unexpected HTTP status 500");
-        assert_eq!(served.load(Ordering::SeqCst), 2);
+        assert_eq!(served.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
     async fn a_client_error_is_not_retried() {
-        let (url, served) = scripted_server(&[401]).await;
-        let err = Firebase::new(&url).unwrap().at("x").get_as_string(None, None).await.unwrap_err();
+        let (url, served) = scripted_server(&[Reply::With(401, "")]).await;
+        let err = db(&url).get_as_string(None, None).await.unwrap_err();
         assert!(matches!(err, RequestError::HttpStatus(401)));
         assert_eq!(served.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn a_write_is_never_retried() {
-        let (url, served) = scripted_server(&[503, 200]).await;
-        let err = Firebase::new(&url).unwrap().at("x").put_json(serde_json::json!(1)).await.unwrap_err();
+    async fn a_put_that_got_a_response_is_not_retried() {
+        let (url, served) = scripted_server(&[Reply::With(503, ""), OK]).await;
+        let err = db(&url).put_json(json!(1)).await.unwrap_err();
         assert!(matches!(err, RequestError::HttpStatus(503)));
         assert_eq!(served.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_put_is_retried_once_after_a_reset() {
+        let (url, served) = scripted_server(&[Reply::Drop, OK]).await;
+        let response = db(&url).put_json(json!({"a": 1})).await.unwrap();
+        assert_eq!(response.data, "{\"a\":1}");
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_put_gives_up_after_one_retry() {
+        let (url, served) = scripted_server(&[Reply::Drop]).await;
+        let err = db(&url).put_json(json!(1)).await.unwrap_err();
+        assert!(matches!(err, RequestError::NetworkError(_)), "{err}");
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_conditional_put_whose_first_attempt_landed_is_a_success() {
+        // The reset hid the 200; the retry finds our own value under a new ETag.
+        let (url, served) = scripted_server(&[Reply::Drop, Reply::With(412, "{\"a\":1}")]).await;
+        let response = db(&url).set_with_key("k", &json!({"a": 1}), None, Some("old")).await.unwrap();
+        assert_eq!(response.etag, None, "a success has no ETag unless one was asked for");
+        assert_eq!(response.data, "{\"a\":1}");
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_conditional_put_that_landed_keeps_the_etag_when_asked_for() {
+        let (url, _) = scripted_server(&[Reply::Drop, Reply::With(412, "null")]).await;
+        let response = db(&url).set_with_key("k", &Value::Null, Some(true), Some("old")).await.unwrap();
+        assert_eq!(response.etag.as_deref(), Some("tag1"));
+    }
+
+    #[tokio::test]
+    async fn a_conditional_put_retry_still_reports_a_real_conflict() {
+        let (url, served) = scripted_server(&[Reply::Drop, Reply::With(412, "{\"a\":2}")]).await;
+        let response = db(&url).set_with_key("k", &json!({"a": 1}), None, Some("old")).await.unwrap();
+        assert_eq!(response.etag.as_deref(), Some("tag1"));
+        assert_eq!(response.data, "{\"a\":2}");
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_put_with_a_server_value_is_not_retried() {
+        let (url, served) = scripted_server(&[Reply::Drop, OK]).await;
+        let increment = json!({"score": {".sv": {"increment": 5}}});
+        assert!(db(&url).put_json(increment).await.is_err());
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_push_is_not_retried() {
+        let (url, served) = scripted_server(&[Reply::Drop]).await;
+        assert!(db(&url).post_json(json!(1)).await.is_err());
+        assert!(db(&url).set(&json!(1)).await.is_err());
+        assert_eq!(served.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_patch_or_delete_is_not_retried() {
+        let (url, served) = scripted_server(&[Reply::Drop, OK]).await;
+        assert!(db(&url).update(&json!({"a": 1}), None, None).await.is_err());
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        let (url, served) = scripted_server(&[Reply::Drop, OK]).await;
+        assert!(db(&url).delete().await.is_err());
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_atomic_increment_does_not_retry_its_write() {
+        let (url, served) = scripted_server(&[Reply::With(200, "5"), Reply::Drop, Reply::With(200, "6")]).await;
+        let err = db(&url).update_atomically_by(1, None, None, None).await.unwrap_err();
+        assert!(matches!(err, RequestError::NetworkError(_)), "{err}");
+        assert_eq!(served.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
