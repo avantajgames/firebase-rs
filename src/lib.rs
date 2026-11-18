@@ -162,47 +162,31 @@ impl Firebase {
         self.uri.to_string()
     }
 
-    /// Retries only what is safe to repeat:
-    /// - a GET, up to [`READ_RETRY_DELAYS_MS`] more times after a transient failure (no
-    ///   response, 429 or 5xx), after a short backoff;
-    /// - a PUT, once, when it got no response at all (a reset or a failed connect), unless its
-    ///   body holds a server value (`.sv`, e.g. an increment). A plain PUT writes the same value
-    ///   again. An ETag-conditional PUT whose first attempt did land answers the retry with 412;
-    ///   when the stored value is the one sent, that is our own write and it is reported as a
-    ///   success, so callers that treat 412 as a conflict do not apply their change twice.
-    ///
-    /// POST (push), PATCH (may carry increments) and DELETE are never retried.
+    /// Sends the request under the retry policy its method and body allow (see [`RetryPolicy`]).
     async fn request(&self, method: Method, data: Option<Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
-        match method {
-            Method::GET => self.read_with_retries(include_etag, etag).await,
-            Method::PUT if is_repeatable(data.as_ref()) => self.put_with_retry(data.as_ref(), include_etag, etag).await,
-            _ => self.request_once(&method, data.as_ref(), include_etag, etag).await.map(|attempt| attempt.response),
-        }
+        let policy = match method {
+            Method::GET => &READS,
+            Method::PUT if is_repeatable(data.as_ref()) => &PUTS,
+            _ => &NO_RETRY,
+        };
+        self.request_with(policy, &method, data.as_ref(), include_etag, etag).await
     }
 
-    async fn read_with_retries(&self, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
-        let mut result = self.request_once(&Method::GET, None, include_etag, etag).await;
-        for delay_ms in READ_RETRY_DELAYS_MS {
-            match &result {
-                Err(err) if err.is_transient() => {
-                    backoff(delay_ms).await;
-                    result = self.request_once(&Method::GET, None, include_etag, etag).await;
-                }
-                _ => break,
+    async fn request_with(&self, policy: &RetryPolicy, method: &Method, data: Option<&Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
+        let mut result = self.request_once(method, data, include_etag, etag).await;
+        let mut retried = false;
+        for &delay_ms in policy.delays_ms {
+            if !matches!(&result, Err(err) if (policy.retry_on)(err)) {
+                break;
             }
+            backoff(delay_ms).await;
+            result = self.request_once(method, data, include_etag, etag).await;
+            retried = true;
         }
-        result.map(|attempt| attempt.response)
-    }
-
-    async fn put_with_retry(&self, data: Option<&Value>, include_etag: bool, etag: Option<&str>) -> RequestResult<Response> {
-        let first = self.request_once(&Method::PUT, data, include_etag, etag).await;
-        if !matches!(first, Err(RequestError::NetworkError(_))) {
-            return first.map(|attempt| attempt.response);
-        }
-        backoff(WRITE_RETRY_DELAY_MS).await;
-        let attempt = self.request_once(&Method::PUT, data, include_etag, etag).await?;
-        if attempt.precondition_failed && stored_value_is(&attempt.response.data, data) {
-            // The first attempt was applied; answer as a 200 would have.
+        let attempt = result?;
+        if retried && attempt.precondition_failed && stored_value_is(&attempt.response.data, data) {
+            // A reset hid the 200 of an earlier attempt: the stored value is ours. Answer as
+            // that 200 would have, so a caller does not take its own write for a conflict.
             let etag = if include_etag { attempt.response.etag } else { None };
             return Ok(Response { etag, data: attempt.response.data });
         }
@@ -266,9 +250,7 @@ impl Firebase {
         Box::pin(async move {
             if let Some(etag) = etag {
                 let data = json!(value);
-                // Never retried: this PUT is one step of an increment.
-                let updated_response = self.request_once(&Method::PUT, Some(&data), false, Some(etag.as_str())).await
-                    .map(|attempt| attempt.response);
+                let updated_response = self.request_with(&NO_RETRY, &Method::PUT, Some(&data), false, Some(etag.as_str())).await;
                 if let Ok(response) = &updated_response {
                     if response.etag.is_none() {
                         return updated_response;
@@ -469,11 +451,22 @@ impl Firebase {
     }
 }
 
-/// Pauses after the given delays before retrying a read.
-const READ_RETRY_DELAYS_MS: [u64; 2] = [200, 400];
-/// Pause before the single retry of a PUT that got no response.
-const WRITE_RETRY_DELAY_MS: u64 = 200;
-/// Up to this much is added to each pause, so requests that failed together do not retry in step.
+/// Which failures of a request are tried again, and after which pauses.
+struct RetryPolicy {
+    /// One pause per retry, before it; [`RETRY_JITTER_MS`] at most is added to each.
+    delays_ms: &'static [u64],
+    retry_on: fn(&RequestError) -> bool,
+}
+
+/// A GET changes nothing: retried after no response, 429 or 5xx.
+const READS: RetryPolicy = RetryPolicy { delays_ms: &[200, 400], retry_on: RequestError::is_transient };
+/// A PUT without server values writes the same thing again, so it is retried once, and only when
+/// there was no response at all. A conditional one that did land is settled in `request_with`.
+const PUTS: RetryPolicy = RetryPolicy { delays_ms: &[200], retry_on: |err| matches!(err, RequestError::NetworkError(_)) };
+/// POST (push), PATCH (may carry increments), DELETE, PUTs with `.sv`, and the PUT inside
+/// `update_atomically_by` (a step of an increment).
+const NO_RETRY: RetryPolicy = RetryPolicy { delays_ms: &[], retry_on: |_| false };
+/// So that requests that failed together do not retry in step.
 const RETRY_JITTER_MS: u64 = 100;
 
 /// One HTTP exchange that got a response the caller can use (200 or 412).
